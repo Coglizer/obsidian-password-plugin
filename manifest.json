@@ -1,0 +1,9 @@
+{
+  "id": "password-protected-folders",
+  "name": "Password Protected Folders",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "Password-protect and hide folders with optional AES-256-GCM encryption at rest.",
+  "author": "nexus",
+  "isDesktopOnly": true
+}

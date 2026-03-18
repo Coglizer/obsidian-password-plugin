@@ -1,0 +1,75 @@
+.password-plugin-hidden {
+  display: none !important;
+}
+
+/* Locked folder with visible lock icon */
+.password-plugin-locked > .tree-item-self {
+  opacity: 0.7;
+}
+
+.password-plugin-lock-icon {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 4px;
+  cursor: pointer;
+  color: var(--text-muted);
+  vertical-align: middle;
+  flex-shrink: 0;
+}
+
+.password-plugin-lock-icon:hover {
+  color: var(--text-accent);
+}
+
+.password-plugin-lock-icon svg {
+  width: 14px;
+  height: 14px;
+}
+
+.password-plugin-modal .modal-content {
+  padding: 1em;
+}
+
+.password-plugin-modal .setting-item {
+  border-top: none;
+  padding: 0.5em 0;
+}
+
+.password-plugin-modal input[type="password"] {
+  width: 100%;
+}
+
+.password-plugin-modal .error-message {
+  color: var(--text-error);
+  font-size: 0.85em;
+  margin-top: 0.25em;
+}
+
+.password-plugin-modal .mode-description {
+  font-size: 0.85em;
+  color: var(--text-muted);
+  margin-top: 0.25em;
+}
+
+.password-plugin-folder-list .folder-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5em 0;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.password-plugin-folder-list .folder-item .folder-path {
+  font-weight: 500;
+}
+
+.password-plugin-folder-list .folder-item .folder-mode {
+  font-size: 0.85em;
+  color: var(--text-muted);
+  margin-left: 0.5em;
+}
+
+.password-plugin-folder-list .folder-item .folder-actions {
+  display: flex;
+  gap: 0.5em;
+}
