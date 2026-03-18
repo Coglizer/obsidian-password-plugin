@@ -4,18 +4,26 @@ import {
   PluginSettings,
   ProtectedFolderConfig,
   PendingOperation,
+  UnlockResult,
 } from './types';
 import {
-  deriveKey,
-  hashKey,
-  base64ToSalt,
+  deriveKeyAndHash,
+  constantTimeEqual,
+  base64ToBytes,
   encryptFolder,
   decryptFolder,
+  MIN_ITERATIONS,
 } from './crypto';
+
+interface RateLimitInfo {
+  count: number;
+  lockedUntil: number;
+}
 
 export class StateManager {
   private states: Map<string, FolderState> = new Map();
   private autoLockTimer: ReturnType<typeof setTimeout> | null = null;
+  private failedAttempts: Map<string, RateLimitInfo> = new Map();
 
   constructor(
     private vault: Vault,
@@ -32,7 +40,6 @@ export class StateManager {
       });
     }
 
-    // Check for pending operations from a crash
     if (
       this.settings.pendingOperations &&
       this.settings.pendingOperations.length > 0
@@ -56,6 +63,39 @@ export class StateManager {
     this.settings.pendingOperations = [];
     await this.persistSettings();
   }
+
+  // --- Rate limiting ---
+
+  private checkRateLimit(path: string): string | null {
+    const info = this.failedAttempts.get(path);
+    if (!info) return null;
+    if (info.lockedUntil > Date.now()) {
+      const seconds = Math.ceil((info.lockedUntil - Date.now()) / 1000);
+      return `Too many failed attempts. Try again in ${seconds}s.`;
+    }
+    return null;
+  }
+
+  private recordFailedAttempt(path: string): void {
+    const info = this.failedAttempts.get(path) ?? { count: 0, lockedUntil: 0 };
+    info.count++;
+    if (info.count >= 20) {
+      info.lockedUntil = Date.now() + 300000; // 5 minutes
+    } else if (info.count >= 10) {
+      info.lockedUntil = Date.now() + 30000; // 30s
+    } else if (info.count >= 5) {
+      info.lockedUntil = Date.now() + 5000; // 5s
+    } else if (info.count >= 3) {
+      info.lockedUntil = Date.now() + 1000; // 1s
+    }
+    this.failedAttempts.set(path, info);
+  }
+
+  private clearFailedAttempts(path: string): void {
+    this.failedAttempts.delete(path);
+  }
+
+  // --- State queries ---
 
   getState(path: string): FolderState | undefined {
     return this.states.get(path);
@@ -83,17 +123,29 @@ export class StateManager {
       .map(([p]) => p);
   }
 
-  async unlock(path: string, password: string): Promise<boolean> {
-    const config = this.getConfig(path);
-    if (!config) return false;
+  // --- Unlock / Lock ---
 
-    const salt = base64ToSalt(config.salt);
-    const key = await deriveKey(password, salt, this.settings.pbkdf2Iterations);
-    const keyHash = await hashKey(key);
-
-    if (keyHash !== config.passwordHash) {
-      return false;
+  async unlock(path: string, password: string): Promise<UnlockResult> {
+    // Check rate limit
+    const rateLimitMsg = this.checkRateLimit(path);
+    if (rateLimitMsg) {
+      return { success: false, error: rateLimitMsg };
     }
+
+    const config = this.getConfig(path);
+    if (!config) return { success: false, error: 'Folder not found.' };
+
+    // Use per-folder iterations (fall back to global for legacy configs)
+    const iterations = config.iterations ?? this.settings.pbkdf2Iterations;
+    const salt = base64ToBytes(config.salt);
+    const { key, hash: keyHash } = await deriveKeyAndHash(password, salt, iterations);
+
+    if (!constantTimeEqual(keyHash, config.passwordHash)) {
+      this.recordFailedAttempt(path);
+      return { success: false, error: 'Wrong password.' };
+    }
+
+    this.clearFailedAttempts(path);
 
     if (config.mode === 'encrypt') {
       const op: PendingOperation = {
@@ -121,7 +173,7 @@ export class StateManager {
       } catch (e) {
         new Notice(`Error decrypting folder: ${e}`);
         await this.clearPendingOps();
-        return false;
+        return { success: false, error: `Decryption failed: ${e}` };
       }
 
       await this.clearPendingOps();
@@ -129,7 +181,7 @@ export class StateManager {
 
     this.states.set(path, { path, isUnlocked: true, derivedKey: key });
     this.resetAutoLockTimer();
-    return true;
+    return { success: true };
   }
 
   async lock(path: string): Promise<void> {
@@ -205,21 +257,37 @@ export class StateManager {
   async changePassword(
     path: string,
     oldPassword: string,
-    newPassword: string,
-    iterations: number
-  ): Promise<boolean> {
+    newPassword: string
+  ): Promise<UnlockResult> {
+    // Check rate limit
+    const rateLimitMsg = this.checkRateLimit(path);
+    if (rateLimitMsg) {
+      return { success: false, error: rateLimitMsg };
+    }
+
     const config = this.getConfig(path);
-    if (!config) return false;
+    if (!config) return { success: false, error: 'Folder not found.' };
 
-    const oldSalt = base64ToSalt(config.salt);
-    const oldKey = await deriveKey(oldPassword, oldSalt, iterations);
-    const oldHash = await hashKey(oldKey);
-    if (oldHash !== config.passwordHash) return false;
+    const iterations = config.iterations ?? this.settings.pbkdf2Iterations;
+    const oldSalt = base64ToBytes(config.salt);
+    const { hash: oldHash } = await deriveKeyAndHash(oldPassword, oldSalt, iterations);
 
+    if (!constantTimeEqual(oldHash, config.passwordHash)) {
+      this.recordFailedAttempt(path);
+      return { success: false, error: 'Current password is incorrect.' };
+    }
+
+    this.clearFailedAttempts(path);
+
+    // Generate new credentials with current global iterations setting
     const { generateSalt, saltToBase64 } = await import('./crypto');
     const newSalt = generateSalt();
-    const newKey = await deriveKey(newPassword, newSalt, iterations);
-    const newHash = await hashKey(newKey);
+    const newIterations = Math.max(this.settings.pbkdf2Iterations, MIN_ITERATIONS);
+    const { key: newKey, hash: newHash } = await deriveKeyAndHash(
+      newPassword,
+      newSalt,
+      newIterations
+    );
 
     const state = this.states.get(path);
     if (config.mode === 'encrypt' && state?.isUnlocked && state.derivedKey) {
@@ -229,12 +297,13 @@ export class StateManager {
 
     config.salt = saltToBase64(newSalt);
     config.passwordHash = newHash;
+    config.iterations = newIterations;
 
     if (state) {
       state.derivedKey = newKey;
     }
 
-    return true;
+    return { success: true };
   }
 
   updateFolderPath(oldPath: string, newPath: string): void {

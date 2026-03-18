@@ -1,3 +1,5 @@
+import { Platform } from 'obsidian';
+
 const HIDDEN_CLASS = 'password-plugin-hidden';
 const LOCKED_CLASS = 'password-plugin-locked';
 const LOCK_ICON_CLASS = 'password-plugin-lock-icon';
@@ -7,6 +9,24 @@ const LOCK_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14"
 interface LockedFolderInfo {
   path: string;
   mode: 'visible' | 'hidden';
+}
+
+/**
+ * Find the nearest folder container element in the file explorer DOM.
+ * Desktop uses `.tree-item`, mobile uses `.nav-folder` (or falls back to the element itself).
+ */
+function findFolderContainer(el: Element): Element {
+  return el.closest('.tree-item') ?? el.closest('.nav-folder') ?? el;
+}
+
+/**
+ * Find the self/title row within a folder container.
+ * Desktop uses `.tree-item-self`, mobile uses `.nav-folder-title`.
+ */
+function findSelfElement(container: Element): Element {
+  return container.querySelector('.tree-item-self')
+    ?? container.querySelector('.nav-folder-title')
+    ?? container;
 }
 
 export class FolderHider {
@@ -25,7 +45,6 @@ export class FolderHider {
     this.applyAll();
 
     this.observer = new MutationObserver(() => {
-      // Debounce to avoid re-entrant DOM modification loops
       if (!this.applyScheduled) {
         this.applyScheduled = true;
         requestAnimationFrame(() => {
@@ -47,7 +66,6 @@ export class FolderHider {
       this.observer = null;
     }
     this.containerEl = null;
-    // Clean up all our modifications
     document.querySelectorAll(`.${HIDDEN_CLASS}`).forEach((el) => {
       el.classList.remove(HIDDEN_CLASS);
     });
@@ -69,7 +87,6 @@ export class FolderHider {
     this.pauseObserver(() => this.clearPath(path));
   }
 
-  /** Temporarily disconnect observer while modifying DOM to prevent infinite loops */
   private pauseObserver(fn: () => void): void {
     if (this.observer && this.containerEl) {
       this.observer.disconnect();
@@ -85,7 +102,6 @@ export class FolderHider {
 
   private applyAll(): void {
     this.pauseObserver(() => {
-      // Clear everything first
       document.querySelectorAll(`.${HIDDEN_CLASS}`).forEach((el) => {
         el.classList.remove(HIDDEN_CLASS);
       });
@@ -96,7 +112,6 @@ export class FolderHider {
         el.remove();
       });
 
-      // Re-apply all locked folders
       for (const [path] of this.lockedFolders) {
         this.applyForPath(path);
       }
@@ -107,40 +122,45 @@ export class FolderHider {
     const info = this.lockedFolders.get(path);
     if (!info) return;
 
-    const folderSelector = `[data-path="${CSS.escape(path)}"]`;
-    const childSelector = `[data-path^="${CSS.escape(path + '/')}"]`;
+    const escapedPath = this.escapeSelector(path);
+    const folderSelector = `[data-path="${escapedPath}"]`;
+    const childSelector = `[data-path^="${this.escapeSelector(path + '/')}"]`;
 
     if (info.mode === 'hidden') {
-      // Hide the folder and all children completely
       for (const selector of [folderSelector, childSelector]) {
         document.querySelectorAll(selector).forEach((el) => {
-          const treeItem = el.closest('.tree-item') ?? el;
-          treeItem.classList.add(HIDDEN_CLASS);
+          findFolderContainer(el).classList.add(HIDDEN_CLASS);
         });
       }
     } else {
-      // Visible mode: show folder with lock icon, hide children
+      // Hide children so you can't browse into the folder
       document.querySelectorAll(childSelector).forEach((el) => {
-        const treeItem = el.closest('.tree-item') ?? el;
-        treeItem.classList.add(HIDDEN_CLASS);
+        findFolderContainer(el).classList.add(HIDDEN_CLASS);
       });
 
-      // Add lock styling and icon to the folder itself
+      // Show folder with lock icon
       document.querySelectorAll(folderSelector).forEach((el) => {
-        const treeItem = el.closest('.tree-item') ?? el;
-        treeItem.classList.add(LOCKED_CLASS);
+        const container = findFolderContainer(el);
+        container.classList.add(LOCKED_CLASS);
 
-        const selfEl = treeItem.querySelector('.tree-item-self') ?? el;
+        const selfEl = findSelfElement(container);
         if (!selfEl.querySelector(`.${LOCK_ICON_CLASS}`)) {
           const iconEl = document.createElement('span');
           iconEl.className = LOCK_ICON_CLASS;
           iconEl.innerHTML = LOCK_SVG;
-          iconEl.title = 'Click to unlock';
-          iconEl.addEventListener('click', (e) => {
+          iconEl.setAttribute('aria-label', 'Unlock folder');
+
+          // Use both click and touchend for cross-platform support
+          const handler = (e: Event) => {
             e.stopPropagation();
             e.preventDefault();
             this.onLockIconClick?.(path);
-          });
+          };
+          iconEl.addEventListener('click', handler);
+          if (Platform.isMobile) {
+            iconEl.addEventListener('touchend', handler);
+          }
+
           selfEl.appendChild(iconEl);
         }
       });
@@ -148,16 +168,29 @@ export class FolderHider {
   }
 
   private clearPath(path: string): void {
-    const folderSelector = `[data-path="${CSS.escape(path)}"]`;
-    const childSelector = `[data-path^="${CSS.escape(path + '/')}"]`;
+    const escapedPath = this.escapeSelector(path);
+    const folderSelector = `[data-path="${escapedPath}"]`;
+    const childSelector = `[data-path^="${this.escapeSelector(path + '/')}"]`;
 
     for (const selector of [folderSelector, childSelector]) {
       document.querySelectorAll(selector).forEach((el) => {
-        const treeItem = el.closest('.tree-item') ?? el;
-        treeItem.classList.remove(HIDDEN_CLASS);
-        treeItem.classList.remove(LOCKED_CLASS);
-        treeItem.querySelectorAll(`.${LOCK_ICON_CLASS}`).forEach((icon) => icon.remove());
+        const container = findFolderContainer(el);
+        container.classList.remove(HIDDEN_CLASS);
+        container.classList.remove(LOCKED_CLASS);
+        container.querySelectorAll(`.${LOCK_ICON_CLASS}`).forEach((icon) => icon.remove());
       });
     }
+  }
+
+  /**
+   * Escape a string for use in a CSS selector.
+   * Falls back to manual escaping if CSS.escape is unavailable (some mobile WebViews).
+   */
+  private escapeSelector(value: string): string {
+    if (typeof CSS !== 'undefined' && CSS.escape) {
+      return CSS.escape(value);
+    }
+    // Manual fallback: escape special CSS selector characters
+    return value.replace(/([!"#$%&'()*+,./:;<=>?@[\\\]^`{|}~])/g, '\\$1');
   }
 }

@@ -78,8 +78,8 @@ export class SetPasswordModal extends Modal {
           errorEl.setText('Password is required.');
           return;
         }
-        if (this.password.length < 4) {
-          errorEl.setText('Password must be at least 4 characters.');
+        if (this.password.length < 8) {
+          errorEl.setText('Password must be at least 8 characters.');
           return;
         }
         if (this.password !== this.confirm) {
@@ -97,6 +97,8 @@ export class SetPasswordModal extends Modal {
   }
 
   onClose(): void {
+    this.password = '';
+    this.confirm = '';
     this.contentEl.empty();
   }
 }
@@ -161,6 +163,7 @@ export class UnlockModal extends Modal {
   }
 
   onClose(): void {
+    this.password = '';
     this.contentEl.empty();
   }
 }
@@ -216,8 +219,8 @@ export class ChangePasswordModal extends Modal {
           errorEl.setText('All fields are required.');
           return;
         }
-        if (this.newPassword.length < 4) {
-          errorEl.setText('New password must be at least 4 characters.');
+        if (this.newPassword.length < 8) {
+          errorEl.setText('New password must be at least 8 characters.');
           return;
         }
         if (this.newPassword !== this.confirmPassword) {
@@ -231,6 +234,9 @@ export class ChangePasswordModal extends Modal {
   }
 
   onClose(): void {
+    this.currentPassword = '';
+    this.newPassword = '';
+    this.confirmPassword = '';
     this.contentEl.empty();
   }
 }

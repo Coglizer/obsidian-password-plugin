@@ -3,20 +3,22 @@ import {
   Notice,
   TFolder,
   TFile,
+  Platform,
 } from 'obsidian';
 import {
   PluginSettings,
   DEFAULT_SETTINGS,
   ProtectedFolderConfig,
+  UnlockResult,
 } from './types';
 import { StateManager } from './state';
 import { FolderHider } from './explorer/FolderHider';
 import {
   generateSalt,
   saltToBase64,
-  deriveKey,
-  hashKey,
+  deriveKeyAndHash,
   encryptFolder,
+  MIN_ITERATIONS,
 } from './crypto';
 import { SetPasswordModal, UnlockModal } from './ui/PasswordModal';
 import { SettingsTab } from './ui/SettingsTab';
@@ -28,6 +30,15 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
   folderHider: FolderHider = new FolderHider();
 
   async onload(): Promise<void> {
+    // Verify crypto API is available (required for all functionality)
+    if (!crypto?.subtle) {
+      new Notice(
+        'Password Protected Folders: Web Crypto API is not available. Plugin cannot function.',
+        10000
+      );
+      return;
+    }
+
     await this.loadSettings();
 
     this.stateManager = new StateManager(
@@ -38,18 +49,13 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
 
     await this.stateManager.initialize();
 
-    // Wait for layout to be ready before manipulating DOM
     this.app.workspace.onLayoutReady(() => {
       this.initExplorer();
     });
 
-    // Register context menu
     registerContextMenu(this);
-
-    // Register settings tab
     this.addSettingTab(new SettingsTab(this.app, this));
 
-    // Register lock-all command
     this.addCommand({
       id: 'lock-all-folders',
       name: 'Lock all protected folders',
@@ -58,7 +64,6 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
       },
     });
 
-    // Register unlock command (opens a chooser)
     this.addCommand({
       id: 'unlock-folder',
       name: 'Unlock a protected folder',
@@ -70,8 +75,6 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
           new Notice('No locked folders.');
           return;
         }
-        // For simplicity, prompt for the first locked folder
-        // A more elaborate UI could use a suggester
         if (locked.length === 1) {
           this.promptUnlock(locked[0]);
         } else {
@@ -82,13 +85,11 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
       },
     });
 
-    // Ribbon icon
     this.addRibbonIcon('lock', 'Lock all folders', async () => {
       await this.lockAllFolders();
       new Notice('All folders locked.');
     });
 
-    // Intercept file open for locked folders
     this.registerEvent(
       this.app.workspace.on('file-open', (file) => {
         if (!file) return;
@@ -96,7 +97,6 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
       })
     );
 
-    // Track folder renames
     this.registerEvent(
       this.app.vault.on('rename', (file, oldPath) => {
         if (file instanceof TFolder) {
@@ -113,7 +113,6 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
       })
     );
 
-    // Track folder deletes
     this.registerEvent(
       this.app.vault.on('delete', (file) => {
         if (file instanceof TFolder && this.stateManager.isProtected(file.path)) {
@@ -124,23 +123,31 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
       })
     );
 
-    // Auto-lock timer: reset on user activity
     this.registerDomEvent(document, 'click', () => {
       this.stateManager.resetAutoLockTimer();
     });
     this.registerDomEvent(document, 'keydown', () => {
       this.stateManager.resetAutoLockTimer();
     });
+
+    // Mobile: reset auto-lock on touch and lock when app goes to background
+    if (Platform.isMobile) {
+      this.registerDomEvent(document, 'touchstart', () => {
+        this.stateManager.resetAutoLockTimer();
+      });
+
+      this.registerDomEvent(document, 'visibilitychange', () => {
+        if (document.visibilityState === 'hidden' && this.settings.lockOnClose) {
+          this.lockAllFolders();
+        }
+      });
+    }
   }
 
   onunload(): void {
-    // Stop observer and clean up DOM first (synchronous)
     this.stateManager.clearAutoLockTimer();
     this.folderHider.stop();
 
-    // Encrypt unlocked folders best-effort
-    // Obsidian doesn't await onunload, so this may not complete on quit.
-    // The lockOnClose + encrypt workflow is inherently limited by this.
     if (this.settings.lockOnClose) {
       const unlocked = this.stateManager.getAllUnlockedPaths();
       for (const path of unlocked) {
@@ -150,18 +157,15 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
   }
 
   private initExplorer(): void {
-    // Set up the unlock callback for lock icon clicks
     this.folderHider.setUnlockCallback((path) => {
       this.promptUnlock(path);
     });
 
-    // Find the file explorer container
     const explorerLeaf = this.app.workspace.getLeavesOfType('file-explorer')[0];
     if (explorerLeaf?.view?.containerEl) {
       this.folderHider.start(explorerLeaf.view.containerEl);
     }
 
-    // Apply lock state to all protected folders
     for (const path of this.stateManager.getAllProtectedPaths()) {
       if (!this.stateManager.isUnlocked(path)) {
         const config = this.stateManager.getConfig(path);
@@ -171,10 +175,8 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
   }
 
   private interceptFileOpen(file: TFile): void {
-    // Check if this file belongs to a locked protected folder
     for (const path of this.stateManager.getAllProtectedPaths()) {
       if (file.path.startsWith(path + '/') && !this.stateManager.isUnlocked(path)) {
-        // Close the active leaf that just opened this file
         const activeLeaf = this.app.workspace.activeLeaf;
         if (activeLeaf) {
           activeLeaf.detach();
@@ -187,7 +189,6 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
   }
 
   async protectFolder(folderPath: string): Promise<void> {
-    // Check nesting
     const allProtected = this.stateManager.getAllProtectedPaths();
     for (const pp of allProtected) {
       if (folderPath.startsWith(pp + '/')) {
@@ -202,12 +203,12 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
 
     new SetPasswordModal(this.app, folderPath, async (result) => {
       const salt = generateSalt();
-      const key = await deriveKey(
+      const iterations = Math.max(this.settings.pbkdf2Iterations, MIN_ITERATIONS);
+      const { key, hash: keyHash } = await deriveKeyAndHash(
         result.password,
         salt,
-        this.settings.pbkdf2Iterations
+        iterations
       );
-      const keyHash = await hashKey(key);
 
       const config: ProtectedFolderConfig = {
         path: folderPath,
@@ -215,12 +216,12 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
         passwordHash: keyHash,
         mode: result.mode,
         visibility: result.visibility,
+        iterations,
         createdAt: Date.now(),
       };
 
       await this.stateManager.addProtectedFolder(config);
 
-      // If encrypt mode, encrypt files now
       if (result.mode === 'encrypt') {
         const files = this.app.vault
           .getFiles()
@@ -235,7 +236,6 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
         }
       }
 
-      // Lock the folder in the explorer
       this.folderHider.lockFolder(folderPath, result.visibility);
       await this.saveSettings();
       new Notice(`Folder "${folderPath}" is now protected (${result.mode} mode).`);
@@ -244,23 +244,23 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
 
   promptUnlock(folderPath: string): void {
     const modal = new UnlockModal(this.app, folderPath, async (password) => {
-      const success = await this.unlockFolder(folderPath, password);
-      if (success) {
+      const result = await this.unlockFolder(folderPath, password);
+      if (result.success) {
         modal.close();
         new Notice(`Folder "${folderPath}" unlocked.`);
       } else {
-        modal.showError('Wrong password. Try again.');
+        modal.showError(result.error ?? 'Wrong password.');
       }
     });
     modal.open();
   }
 
-  async unlockFolder(folderPath: string, password: string): Promise<boolean> {
-    const success = await this.stateManager.unlock(folderPath, password);
-    if (success) {
+  async unlockFolder(folderPath: string, password: string): Promise<UnlockResult> {
+    const result = await this.stateManager.unlock(folderPath, password);
+    if (result.success) {
       this.folderHider.unlockFolder(folderPath);
     }
-    return success;
+    return result;
   }
 
   async lockFolder(folderPath: string): Promise<void> {
@@ -282,7 +282,6 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
   async loadSettings(): Promise<void> {
     const data = await this.loadData();
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
-    // Ensure protectedFolders is always an array
     if (!Array.isArray(this.settings.protectedFolders)) {
       this.settings.protectedFolders = [];
     }

@@ -18,7 +18,7 @@ export class SettingsTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('PBKDF2 iterations')
-      .setDesc('Higher values are more secure but slower. Minimum recommended: 100,000.')
+      .setDesc('Higher values are more secure but slower. Minimum enforced: 100,000.')
       .addText((text) => {
         text
           .setValue(String(this.plugin.settings.pbkdf2Iterations))
@@ -66,7 +66,6 @@ export class SettingsTab extends PluginSettingTab {
           });
       });
 
-    // Protected folders list
     containerEl.createEl('h3', { text: 'Protected Folders' });
 
     if (this.plugin.settings.protectedFolders.length === 0) {
@@ -102,12 +101,12 @@ export class SettingsTab extends PluginSettingTab {
         const unlockBtn = actionsEl.createEl('button', { text: 'Unlock' });
         unlockBtn.addEventListener('click', () => {
           new UnlockModal(this.app, config.path, async (password) => {
-            const success = await this.plugin.unlockFolder(config.path, password);
-            if (success) {
+            const result = await this.plugin.unlockFolder(config.path, password);
+            if (result.success) {
               new Notice(`Folder "${config.path}" unlocked.`);
               this.display();
             } else {
-              new Notice('Wrong password.');
+              new Notice(result.error ?? 'Wrong password.');
             }
           }).open();
         });
@@ -119,17 +118,16 @@ export class SettingsTab extends PluginSettingTab {
           this.app,
           config.path,
           async (currentPw, newPw) => {
-            const success = await this.plugin.stateManager.changePassword(
+            const result = await this.plugin.stateManager.changePassword(
               config.path,
               currentPw,
-              newPw,
-              this.plugin.settings.pbkdf2Iterations
+              newPw
             );
-            if (success) {
+            if (result.success) {
               await this.plugin.saveSettings();
               new Notice('Password changed successfully.');
             } else {
-              new Notice('Current password is incorrect.');
+              new Notice(result.error ?? 'Current password is incorrect.');
             }
           }
         ).open();

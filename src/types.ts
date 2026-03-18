@@ -4,6 +4,7 @@ export interface ProtectedFolderConfig {
   passwordHash: string;
   mode: 'encrypt' | 'hide';
   visibility: 'visible' | 'hidden';
+  iterations: number;
   createdAt: number;
 }
 
@@ -40,4 +41,9 @@ export interface PendingOperation {
   operation: 'encrypt' | 'decrypt';
   files: string[];
   completedFiles: string[];
+}
+
+export interface UnlockResult {
+  success: boolean;
+  error?: string;
 }

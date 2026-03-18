@@ -5,5 +5,5 @@
   "minAppVersion": "0.15.0",
   "description": "Password-protect and hide folders with optional AES-256-GCM encryption at rest.",
   "author": "nexus",
-  "isDesktopOnly": true
+  "isDesktopOnly": false
 }
