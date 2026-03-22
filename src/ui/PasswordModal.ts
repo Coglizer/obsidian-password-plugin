@@ -1,3 +1,12 @@
+/**
+ * Password modals — three variants for different operations:
+ *   SetPasswordModal:    Initial folder protection setup (password + mode + visibility)
+ *   UnlockModal:         Single password prompt to unlock a locked folder
+ *   ChangePasswordModal: Current + new password fields to change an existing password
+ *
+ * All modals clear sensitive fields (passwords) in onClose() to minimize
+ * time that password strings linger in memory.
+ */
 import { App, Modal, Setting } from 'obsidian';
 
 type ProtectionMode = 'encrypt' | 'hide';
@@ -131,13 +140,14 @@ export class UnlockModal extends Modal {
         text.inputEl.type = 'password';
         text.inputEl.placeholder = 'Enter password';
         text.onChange((value) => (this.password = value));
-        // Submit on Enter
+        // Allow Enter key to submit — common UX expectation for password fields
         text.inputEl.addEventListener('keydown', (e) => {
           if (e.key === 'Enter') {
             this.submit(errorEl);
           }
         });
-        // Focus the input
+        // Auto-focus after a short delay — Obsidian's modal animation needs
+        // a frame to finish before focus will stick
         setTimeout(() => text.inputEl.focus(), 50);
       });
 
@@ -153,8 +163,9 @@ export class UnlockModal extends Modal {
       errorEl.setText('Password is required.');
       return;
     }
+    // Modal stays open after submit — the caller decides whether to close (success)
+    // or call showError() (wrong password). This avoids a flash-close-reopen cycle.
     this.onSubmit(this.password);
-    // Don't close here — the caller will close on success or show error
   }
 
   showError(msg: string): void {

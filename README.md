@@ -1,6 +1,6 @@
 # Password Protected Folders for Obsidian
 
-A desktop-only Obsidian plugin that lets you password-protect individual folders in your vault. Choose between **full AES-256-GCM encryption at rest** (files are unreadable outside Obsidian) or **UI-only locking** (files hidden in the Obsidian interface but remain plaintext on disk). Each folder gets its own independent password.
+An Obsidian plugin that lets you password-protect individual folders in your vault. Choose between **full AES-256-GCM encryption at rest** (files are unreadable outside Obsidian) or **UI-only locking** (files hidden in the Obsidian interface but remain plaintext on disk). Each folder gets its own independent password.
 
 ---
 
@@ -62,7 +62,7 @@ Then reload Obsidian (Ctrl/Cmd+R) or restart it.
 1. Right-click any folder in the file explorer
 2. Select **"Protect this folder"**
 3. In the dialog:
-   - Enter and confirm your password (minimum 4 characters)
+   - Enter and confirm your password (minimum 8 characters)
    - Choose **Protection mode**:
      - *Full Encryption (AES-256-GCM)* — Encrypts all files on disk
      - *UI-Only Hiding* — Hides files in Obsidian only
@@ -130,16 +130,19 @@ Enter the correct password and the folder's contents become accessible.
 - **IV:** 12-byte random IV per file, stored in the encrypted file header
 - **Implementation:** Uses the Web Crypto API (`crypto.subtle`) available in Obsidian's Electron runtime — no external crypto libraries
 
-### Encrypted file format
+### Encrypted file format (v2)
 
-Each encrypted file has the extension `.enc` appended to its original name and contains:
+Each encrypted file has the extension `.enc` appended to its original name. The binary layout is:
 
 ```
-{"version":1,"iv":"<base64>","originalExtension":"<ext>"}\n<base64-encoded-ciphertext>
+[4-byte header length (big-endian uint32)] [JSON header bytes] [raw AES-256-GCM ciphertext]
 ```
 
-- Line 1: JSON header with version, IV, and original file extension
-- Line 2: Base64-encoded AES-256-GCM ciphertext
+- **Header:** JSON containing `version`, `iv` (base64 12-byte IV), and `originalExtension`
+- **AAD:** The header bytes are passed as Additional Authenticated Data to AES-GCM, making them tamper-proof without encrypting them
+- **Ciphertext:** Raw encrypted bytes (not base64), keeping file size close to the original
+
+Legacy v1 files (text/base64 format) are automatically detected and supported for backward compatibility.
 
 ### Password verification
 
@@ -163,12 +166,128 @@ If Obsidian crashes during an encrypt/decrypt operation:
 
 ---
 
-## Limitations
+## Security Limitations & Known Constraints
 
-- **Desktop only** — This plugin uses Electron APIs and DOM manipulation not available on mobile
-- **Lock on close with encryption** — Obsidian doesn't await async operations during shutdown, so re-encryption on close is best-effort. For maximum security, manually lock encrypted folders before quitting
+> **Read this section carefully before relying on this plugin for sensitive data.**
+> These are architectural limitations of Obsidian's plugin system and the browser/Electron runtime. They cannot be fixed by this plugin alone.
+
+### Plaintext exposure while unlocked
+
+When you unlock an encrypted folder, **all files are decrypted to plaintext on disk** for the entire duration the folder is unlocked. During this window:
+
+- **Cloud sync services** (iCloud, Dropbox, Google Drive, OneDrive) will detect the file changes and **upload plaintext copies** to the cloud. Most cloud providers retain version history — even if you lock the folder again, plaintext versions may persist in cloud trash or version history indefinitely.
+- **OS search indexing** (Spotlight on macOS, Windows Search) may index the decrypted file contents.
+- **Backup tools** (Time Machine, etc.) may snapshot the plaintext versions.
+- Any other application running on the device can read the plaintext files.
+
+**This is the most significant limitation.** Obsidian's plugin API provides no way to serve decrypted content from memory without writing it to disk. A virtual filesystem layer would be needed, which Obsidian does not support.
+
+**Recommendation:** If you sync your vault to the cloud, understand that the cloud provider has access to your plaintext every time you unlock. Minimize the time folders stay unlocked. For truly sensitive data, consider whether cloud sync and encryption mode are compatible for your threat model.
+
+### Other Obsidian plugins can bypass all protections
+
+Obsidian has no plugin sandboxing or permission model. **Any installed plugin** can:
+
+- Call `vault.read()` or `vault.adapter.read()` on files inside protected folders
+- Enumerate all files with `vault.getFiles()`, including hidden ones
+- Access decrypted file contents while a folder is unlocked
+
+This plugin hides folders in the UI and intercepts file-open events, but these are best-effort guards — not an access control boundary. There is no mechanism in Obsidian's architecture to restrict one plugin's vault access from another.
+
+**Recommendation:** Only install plugins you trust. Treat this plugin as protection against casual browsing, not against malicious plugins.
+
+### Encryption cannot complete on app close
+
+Obsidian does not `await` the plugin's `onunload()` method — it is synchronous. When you close Obsidian (or the plugin is disabled) with encrypted folders unlocked:
+
+- The plugin attempts to re-encrypt files, but the process exits before encryption finishes
+- Files may remain as plaintext on disk
+- On mobile, the OS can suspend the app at any time during background encryption
+
+The plugin mitigates this on mobile by also attempting to lock when the app returns to foreground, but this is not guaranteed.
+
+**Recommendation:** Always manually lock encrypted folders before closing Obsidian. Do not rely on "Lock on close" for encrypt mode — it is best-effort only.
+
+### DOM hiding is not a security boundary
+
+Folder hiding in the file explorer uses CSS (`display: none`). Anyone with access to the Obsidian window can open Developer Tools and run:
+
+```js
+document.querySelectorAll('.password-plugin-hidden')
+  .forEach(e => e.classList.remove('password-plugin-hidden'))
+```
+
+This instantly reveals all hidden folders. This is inherent to browser-based UI — DOM-level security is impossible in an Electron/Chromium environment.
+
+### Search, graph view, and backlinks ignore hiding
+
+Obsidian's built-in features do not respect this plugin's folder hiding:
+
+- **Search** (`Ctrl+Shift+F`) returns results from files inside locked folders (in hide mode, files are plaintext; in encrypt mode while locked, files are `.enc` gibberish)
+- **Graph view** shows nodes for files in hidden folders
+- **Backlinks** panel shows references to/from hidden files
+- **Quick switcher** (`Ctrl+O`) lists files from hidden folders
+
+There is no Obsidian API to exclude files from search, graph, or the quick switcher programmatically.
+
+**Recommendation:** Use encrypt mode if you need to prevent content from appearing in search and graph. In encrypt mode while locked, file contents are encrypted and search will not return meaningful results.
+
+### Filenames are not encrypted
+
+Encrypted files are named `original-name.md.enc` — the original filename (minus extension) is visible on disk and in `.enc` listings. An attacker with filesystem access can see what documents exist without knowing the password.
+
+Encrypting filenames would break Obsidian's link resolution (`[[wiki-links]]`, embeds, backlinks, graph view) because Obsidian resolves these by filename. This would require a virtual filesystem layer that Obsidian does not provide.
+
+### Password strings persist in JavaScript memory
+
+JavaScript strings are immutable and cannot be zeroed after use. The password you type persists in the V8 heap until garbage collection. The derived key material (`ArrayBuffer`) is explicitly zeroed, and the `CryptoKey` is non-extractable, but the original password string cannot be scrubbed.
+
+In practice, an attacker with the ability to dump process memory already has full filesystem access and does not need the password. This is a theoretical concern inherent to all JavaScript applications.
+
+### `data.json` enables offline brute-force attacks
+
+The plugin stores the PBKDF2 salt, SHA-256 verification hash, and iteration count in Obsidian's `data.json` file. An attacker who copies this file can run offline password cracking (GPU-accelerated PBKDF2) with no rate limiting. The in-app rate limiter (exponential backoff) only applies to the running plugin.
+
+At 600,000 PBKDF2 iterations this is slow but not infeasible for weak passwords. There is no way to use Argon2id (memory-hard, GPU-resistant) because the Web Crypto API does not support it.
+
+**Recommendation:** Use a strong, unique password (16+ characters, not a dictionary word). The strength of your password is the primary defense against offline attacks.
+
+### No password recovery
+
+If you forget a folder's password, **the encrypted files are permanently lost**. There is no recovery key, master password, backdoor, or reset mechanism. The password hash stored in `data.json` is one-way — it can verify a correct password but cannot recover one.
+
+**Recommendation:** Use a password manager. Consider keeping a backup of important files in a separate secure location.
+
+### Obsidian version coupling
+
+Folder hiding and lock icons rely on Obsidian's internal DOM structure (`.tree-item`, `.tree-item-self`, `.nav-folder`, `.nav-folder-title`, `data-path` attributes). These are implementation details, not a public API. A major Obsidian UI update could break folder hiding and lock icons without warning.
+
+The encryption/decryption functionality (files on disk) is independent of Obsidian's DOM and will continue to work regardless of UI changes.
+
+---
+
+### Security summary table
+
+| Concern | Encrypt mode (locked) | Encrypt mode (unlocked) | Hide mode |
+|---------|----------------------|------------------------|-----------|
+| Files safe on disk | Yes (.enc) | **No** (plaintext) | **No** (always plaintext) |
+| Safe from cloud sync | Mostly (filenames leak) | **No** (sync uploads plaintext) | **No** |
+| Safe from other plugins | Yes (files are .enc) | **No** (vault API reads plaintext) | **No** |
+| Safe from OS search | Yes (encrypted) | **No** (indexed) | **No** |
+| Safe from git history | Partially (binary blobs) | **No** (plaintext in commits) | **No** |
+| Hidden from Obsidian search | Yes (gibberish) | **No** (indexed) | **No** |
+| Hidden from graph/backlinks | Yes (no parseable links) | **No** | **No** |
+| Survives app crash | Mixed-state risk | Mixed-state risk | Safe (no encryption) |
+| Password recovery possible | **No** | **No** | **No** |
+
+---
+
+## Other Limitations
+
 - **No nested protection** — You cannot protect a folder that is inside an already-protected folder, or protect a parent of an already-protected folder
-- **File explorer DOM** — Folder hiding/lock icons rely on Obsidian's internal DOM structure (`.tree-item`, `data-path` attributes). Major Obsidian UI updates may require plugin updates
+- **No multi-user support** — Single password per folder; no shared access or role-based permissions
+- **Large folders** — Encrypt/decrypt is sequential (one file at a time). Folders with hundreds of files will take noticeable time to lock/unlock
+- **Large files** — Entire file must fit in memory to encrypt/decrypt. Very large files (>500MB) may cause issues on mobile
 
 ---
 

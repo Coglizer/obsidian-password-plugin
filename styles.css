@@ -1,8 +1,20 @@
+/*
+ * Password Protected Folders — Stylesheet
+ *
+ * Three main visual states:
+ *   .password-plugin-hidden  → folder/file completely invisible (display:none)
+ *   .password-plugin-locked  → folder visible but dimmed, with lock icon appended
+ *   (no class)               → normal visible state (unlocked or unprotected)
+ *
+ * Mobile overrides use Obsidian's `.is-mobile` class for larger tap targets.
+ * Desktop uses `.tree-item-self`; mobile uses `.nav-folder-title` — both are targeted.
+ */
+
 .password-plugin-hidden {
   display: none !important;
 }
 
-/* Locked folder with visible lock icon */
+/* Dim the folder title row to visually indicate it's locked */
 .password-plugin-locked > .tree-item-self,
 .password-plugin-locked > .nav-folder-title {
   opacity: 0.7;
@@ -37,7 +49,7 @@
   height: 14px;
 }
 
-/* Mobile: larger lock icon for easier tapping */
+/* Mobile: 44px minimum tap target per Apple/Google accessibility guidelines */
 .is-mobile .password-plugin-lock-icon {
   min-width: 44px;
   min-height: 44px;

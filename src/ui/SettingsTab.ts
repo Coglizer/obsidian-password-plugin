@@ -1,3 +1,14 @@
+/**
+ * Plugin settings tab — provides the main configuration UI.
+ *
+ * Layout:
+ *   1. Global settings: PBKDF2 iterations, auto-lock timeout, lock-on-close toggle
+ *   2. Protected folders list: per-folder actions (lock/unlock, change password, remove)
+ *
+ * The display() method rebuilds the entire UI each time — Obsidian's PluginSettingTab
+ * doesn't support incremental updates, so we call display() again after state changes
+ * (e.g., after locking/unlocking) to refresh the button states.
+ */
 import { App, PluginSettingTab, Setting, Notice } from 'obsidian';
 import type PasswordProtectedFoldersPlugin from '../main';
 import { ChangePasswordModal, UnlockModal } from './PasswordModal';

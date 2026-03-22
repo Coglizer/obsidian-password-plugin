@@ -1,3 +1,15 @@
+/**
+ * Plugin entry point — wires together all subsystems:
+ *   - StateManager:  lock/unlock lifecycle, key management, encryption
+ *   - FolderHider:   DOM manipulation to hide/show folders in the file explorer
+ *   - UI components: modals, settings tab, context menus, commands, ribbon icon
+ *
+ * Key design decisions:
+ *   - All folders start locked on plugin load (safe default)
+ *   - CryptoKeys only exist in memory while a folder is unlocked
+ *   - onunload() is synchronous (Obsidian doesn't await it), so encryption
+ *     on close is best-effort for 'encrypt' mode folders
+ */
 import {
   Plugin,
   Notice,
@@ -30,7 +42,8 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
   folderHider: FolderHider = new FolderHider();
 
   async onload(): Promise<void> {
-    // Verify crypto API is available (required for all functionality)
+    // Gate: the entire plugin depends on Web Crypto for PBKDF2 + AES-GCM.
+    // This check catches extremely old Electron/WebView versions.
     if (!crypto?.subtle) {
       new Notice(
         'Password Protected Folders: Web Crypto API is not available. Plugin cannot function.',
@@ -49,6 +62,8 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
 
     await this.stateManager.initialize();
 
+    // onLayoutReady ensures the file explorer DOM exists before we try to attach
+    // our MutationObserver and apply initial folder visibility
     this.app.workspace.onLayoutReady(() => {
       this.initExplorer();
     });
@@ -90,6 +105,9 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
       new Notice('All folders locked.');
     });
 
+    // Intercept file opens to prevent viewing files inside locked folders.
+    // This catches cases like clicking a link or using quick-open to navigate
+    // directly to a file within a locked folder (bypassing the explorer hiding).
     this.registerEvent(
       this.app.workspace.on('file-open', (file) => {
         if (!file) return;
@@ -97,6 +115,8 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
       })
     );
 
+    // Keep folder protection in sync when the user renames a protected folder.
+    // Without this, renaming would orphan the config (pointing at the old path).
     this.registerEvent(
       this.app.vault.on('rename', (file, oldPath) => {
         if (file instanceof TFolder) {
@@ -113,6 +133,7 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
       })
     );
 
+    // Clean up config when a protected folder is deleted from the vault
     this.registerEvent(
       this.app.vault.on('delete', (file) => {
         if (file instanceof TFolder && this.stateManager.isProtected(file.path)) {
@@ -123,6 +144,9 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
       })
     );
 
+    // Reset the auto-lock inactivity timer on any user interaction.
+    // This ensures the timer only fires after true inactivity, not while
+    // the user is actively working in Obsidian.
     this.registerDomEvent(document, 'click', () => {
       this.stateManager.resetAutoLockTimer();
     });
@@ -130,20 +154,38 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
       this.stateManager.resetAutoLockTimer();
     });
 
-    // Mobile: reset auto-lock on touch and lock when app goes to background
+    // Mobile-specific lifecycle handling
     if (Platform.isMobile) {
+      // Touch events don't always produce 'click' on mobile, so also listen for touch
       this.registerDomEvent(document, 'touchstart', () => {
         this.stateManager.resetAutoLockTimer();
       });
 
+      // Mobile apps get suspended (not closed) when backgrounded. visibilitychange
+      // is the only reliable signal we get before the OS freezes the process.
+      // We lock on BOTH transitions:
+      //   hidden  → best-effort lock before OS suspends (may not finish)
+      //   visible → catch-up lock on resume, in case the background lock was interrupted
       this.registerDomEvent(document, 'visibilitychange', () => {
-        if (document.visibilityState === 'hidden' && this.settings.lockOnClose) {
-          this.lockAllFolders();
+        if (this.settings.lockOnClose) {
+          if (document.visibilityState === 'hidden') {
+            this.lockAllFolders();
+          } else if (document.visibilityState === 'visible') {
+            this.lockAllFolders();
+          }
         }
       });
     }
   }
 
+  /**
+   * Called when the plugin is disabled or Obsidian closes.
+   * IMPORTANT: Obsidian does NOT await this method — it must be synchronous.
+   * For 'encrypt' mode, lock() is async (performs file I/O), so these calls
+   * are fire-and-forget. The encryption may not complete before the process exits.
+   * This is a known limitation; the mobile visibilitychange handler provides
+   * a second chance to lock on mobile.
+   */
   onunload(): void {
     this.stateManager.clearAutoLockTimer();
     this.folderHider.stop();
@@ -151,21 +193,27 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
     if (this.settings.lockOnClose) {
       const unlocked = this.stateManager.getAllUnlockedPaths();
       for (const path of unlocked) {
+        // Fire-and-forget — promises are not awaited (onunload is sync)
         this.stateManager.lock(path);
       }
     }
   }
 
+  /** Wire up the FolderHider to the file explorer and apply initial locked state */
   private initExplorer(): void {
+    // When the user clicks a lock icon, open the unlock modal for that folder
     this.folderHider.setUnlockCallback((path) => {
       this.promptUnlock(path);
     });
 
+    // Attach MutationObserver to the file explorer's container element.
+    // getLeavesOfType('file-explorer') returns the explorer sidebar pane.
     const explorerLeaf = this.app.workspace.getLeavesOfType('file-explorer')[0];
     if (explorerLeaf?.view?.containerEl) {
       this.folderHider.start(explorerLeaf.view.containerEl);
     }
 
+    // Apply initial visibility for all protected folders (all start locked)
     for (const path of this.stateManager.getAllProtectedPaths()) {
       if (!this.stateManager.isUnlocked(path)) {
         const config = this.stateManager.getConfig(path);
@@ -174,9 +222,15 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
     }
   }
 
+  /**
+   * Guard against direct file access within locked folders.
+   * Files can be opened via links, quick-open, or API calls — not just the explorer.
+   * If the file belongs to a locked folder, immediately close the tab and prompt unlock.
+   */
   private interceptFileOpen(file: TFile): void {
     for (const path of this.stateManager.getAllProtectedPaths()) {
       if (file.path.startsWith(path + '/') && !this.stateManager.isUnlocked(path)) {
+        // Detach the active leaf to close the file that was just opened
         const activeLeaf = this.app.workspace.activeLeaf;
         if (activeLeaf) {
           activeLeaf.detach();
@@ -188,6 +242,14 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
     }
   }
 
+  /**
+   * Set up password protection for a new folder.
+   * Opens the SetPasswordModal, then on submit: derives key, creates config,
+   * optionally encrypts existing files, and hides the folder.
+   *
+   * Nesting guard: prevents protecting a folder inside an already-protected folder
+   * (or vice versa) to avoid ambiguous lock/unlock semantics.
+   */
   async protectFolder(folderPath: string): Promise<void> {
     const allProtected = this.stateManager.getAllProtectedPaths();
     for (const pp of allProtected) {
@@ -279,6 +341,8 @@ export default class PasswordProtectedFoldersPlugin extends Plugin {
     }
   }
 
+  /** Load settings from data.json, merging with defaults for any missing fields.
+   *  The protectedFolders guard handles corrupted or first-time data gracefully. */
   async loadSettings(): Promise<void> {
     const data = await this.loadData();
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
